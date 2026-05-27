@@ -228,7 +228,7 @@ footer { text-align: center; color: var(--text-muted); font-size: 0.75rem; margi
 <div class="container">
 
   <div class="header">
-    <button type="button" id="theme-toggle" class="theme-toggle" title="Toggle light/dark theme">dark</button>
+    <button type="button" id="theme-toggle" class="theme-toggle" title="Toggle light/dark theme">light</button>
     <h1>ligprepper</h1>
     <p>Web UI for <code>ligfilter.py</code> &amp; <code>ligprep.py</code></p>
   </div>
@@ -412,10 +412,10 @@ const themeBtn = document.getElementById('theme-toggle');
 function applyTheme(theme) {
   if (theme === 'light') {
     document.documentElement.setAttribute('data-theme', 'light');
-    themeBtn.textContent = 'light';
+    themeBtn.textContent = 'dark';
   } else {
     document.documentElement.removeAttribute('data-theme');
-    themeBtn.textContent = 'dark';
+    themeBtn.textContent = 'light';
   }
 }
 applyTheme(localStorage.getItem('ligprepper-theme') || 'dark');
