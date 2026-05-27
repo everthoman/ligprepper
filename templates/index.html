@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ligprepper — ligand prep &amp; filter</title>
+<script>
+  // Apply saved theme before first paint to avoid a dark-flash on light pages.
+  (function() {
+    try {
+      var t = localStorage.getItem('ligprepper-theme');
+      if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+    } catch (_) {}
+  })();
+</script>
+<style>
+:root {
+  --primary: #2563eb;
+  --primary-dark: #1d4ed8;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --error: #ef4444;
+  /* dark theme (default) */
+  --bg-dark: #0f172a;
+  --bg-card: #1e293b;
+  --bg-card-grad: #0f172a;
+  --bg-input: #0b1220;
+  --bg-log: #050a14;
+  --text: #f1f5f9;
+  --text-muted: #94a3b8;
+  --border: #334155;
+  --log-text: #cbd5e1;
+  --title-grad-a: #60a5fa;
+  --title-grad-b: #34d399;
+  --pill-bg: transparent;
+}
+[data-theme="light"] {
+  --bg-dark: #f1f5f9;
+  --bg-card: #ffffff;
+  --bg-card-grad: #f8fafc;
+  --bg-input: #f8fafc;
+  --bg-log: #0f172a;          /* keep log dark — easier to read scrolling text */
+  --text: #0f172a;
+  --text-muted: #64748b;
+  --border: #cbd5e1;
+  --log-text: #e2e8f0;
+  --title-grad-a: #2563eb;
+  --title-grad-b: #059669;
+  --pill-bg: #ffffff;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg-dark);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.55;
+}
+.container { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem; }
+
+.header {
+  text-align: center;
+  margin-bottom: 1.5rem;
+  padding: 1.5rem;
+  background: linear-gradient(135deg, var(--bg-card) 0%, var(--bg-card-grad) 100%);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  position: relative;
+}
+.header h1 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--title-grad-a), var(--title-grad-b));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.header p { color: var(--text-muted); font-size: 0.9rem; margin-top: 0.4rem; }
+
+.tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+.tab {
+  flex: 1;
+  text-align: center;
+  padding: 0.75rem 1rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.95rem;
+  transition: all 0.15s ease;
+}
+.tab:hover { color: var(--text); border-color: var(--primary); }
+.tab.active {
+  color: var(--text);
+  background: linear-gradient(135deg, rgba(37,99,235,0.25), rgba(16,185,129,0.15));
+  border-color: var(--primary);
+}
+
+.panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin-bottom: 1rem;
+  display: none;
+}
+.panel.active { display: block; }
+
+.group {
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px dashed var(--border);
+}
+.group:last-of-type { border-bottom: none; }
+.group h3 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 0.75rem;
+}
+
+.row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.75rem; }
+.field { display: flex; flex-direction: column; gap: 0.3rem; }
+.field label { font-size: 0.8rem; color: var(--text-muted); }
+.field input[type="text"],
+.field input[type="number"],
+.field input[type="file"],
+.field select {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-family: inherit;
+}
+.field input:focus, .field select:focus { outline: 2px solid var(--primary); outline-offset: -1px; }
+
+.checks { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; }
+.checks label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0.3rem 0.6rem;
+  border-radius: 6px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+}
+.checks label:hover { border-color: var(--primary); }
+.checks input { accent-color: var(--primary); }
+
+.actions { display: flex; gap: 0.75rem; align-items: center; margin-top: 0.5rem; }
+button.primary {
+  background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+  border: none;
+  color: white;
+  padding: 0.65rem 1.4rem;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+button.secondary {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+button.secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.status-pill {
+  font-size: 0.8rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.status-pill.running { color: var(--warning); border-color: var(--warning); }
+.status-pill.ok      { color: var(--success); border-color: var(--success); }
+.status-pill.err     { color: var(--error);   border-color: var(--error); }
+
+.log {
+  margin-top: 1rem;
+  background: var(--bg-log);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem;
+  font-family: 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.78rem;
+  color: var(--log-text);
+  height: 280px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log:empty::before { content: "(no output yet)"; color: var(--text-muted); }
+
+.hint { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.3rem; }
+
+footer { text-align: center; color: var(--text-muted); font-size: 0.75rem; margin-top: 1.5rem; }
+
+.theme-toggle {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 0.35rem 0.85rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1;
+}
+.theme-toggle:hover { border-color: var(--primary); color: var(--primary); }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="header">
+    <button type="button" id="theme-toggle" class="theme-toggle" title="Toggle light/dark theme">dark</button>
+    <h1>ligprepper</h1>
+    <p>Web UI for <code>ligfilter.py</code> &amp; <code>ligprep.py</code></p>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="filter">ligfilter — structural / property filter</div>
+    <div class="tab" data-tab="prep">ligprep — tautomer + 3D conformer prep</div>
+  </div>
+
+  <!-- ─── LIGFILTER PANEL ─────────────────────────────────────────────── -->
+  <form id="form-filter" class="panel active" enctype="multipart/form-data">
+    <div class="group">
+      <h3>Input</h3>
+      <div class="row">
+        <div class="field">
+          <label>Input file (.smi / .csv / .tsv / .sdf)</label>
+          <input type="file" name="input_file" required accept=".smi,.csv,.tsv,.txt,.sdf,.sd">
+        </div>
+        <div class="field">
+          <label>Output format (auto by default)</label>
+          <select name="output_format">
+            <option value="">auto (match input)</option>
+            <option value="smi">.smi</option>
+            <option value="sdf">.sdf</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Parallel jobs (--jobs)</label>
+          <input type="number" name="jobs" min="1" placeholder="auto">
+        </div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Preprocessing (disable below; all ON by default)</h3>
+      <div class="checks">
+        <label><input type="checkbox" name="no_strip" value="1"> disable salt strip</label>
+        <label><input type="checkbox" name="no_neutralize" value="1"> disable neutralize</label>
+        <label><input type="checkbox" name="no_unique" value="1"> disable dedup</label>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Structural alerts</h3>
+      <div class="checks">
+        <label><input type="checkbox" name="pains" value="1"> --pains</label>
+        <label><input type="checkbox" name="reos" value="1"> --reos</label>
+        <label><input type="checkbox" name="custom" value="1"> --custom</label>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Drug-likeness rules</h3>
+      <div class="checks">
+        <label><input type="checkbox" name="ro5" value="1"> Ro5 (1 violation allowed)</label>
+        <label><input type="checkbox" name="ro5_strict" value="1"> Ro5 strict</label>
+        <label><input type="checkbox" name="ro3" value="1"> Ro3 (fragments)</label>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Property ranges (format: <code>MIN:MAX</code>, <code>MIN:</code>, <code>:MAX</code>, or exact value)</h3>
+      <div class="row">
+        <div class="field"><label>--mw</label><input type="text" name="mw" placeholder="e.g. 150:500"></div>
+        <div class="field"><label>--logp</label><input type="text" name="logp" placeholder="e.g. -2:5"></div>
+        <div class="field"><label>--hba</label><input type="text" name="hba" placeholder=":10"></div>
+        <div class="field"><label>--hbd</label><input type="text" name="hbd" placeholder=":5"></div>
+        <div class="field"><label>--rb</label><input type="text" name="rb" placeholder=":10"></div>
+        <div class="field"><label>--tpsa</label><input type="text" name="tpsa" placeholder=":140"></div>
+        <div class="field"><label>--qed</label><input type="text" name="qed" placeholder="0.5:"></div>
+        <div class="field"><label>--chiral</label><input type="text" name="chiral" placeholder=":4"></div>
+        <div class="field"><label>--ha</label><input type="text" name="ha" placeholder="10:50"></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Outlier detection</h3>
+      <div class="row">
+        <div class="field">
+          <label>Enable</label>
+          <div class="checks"><label><input type="checkbox" name="outlier" value="1"> --outlier</label></div>
+        </div>
+        <div class="field">
+          <label>IQR multiplier (--outlier-iqr)</label>
+          <input type="number" step="0.1" name="outlier_iqr" placeholder="1.5">
+        </div>
+        <div class="field">
+          <label>Properties (--outlier-props)</label>
+          <input type="text" name="outlier_props" placeholder="mw,logp,rb">
+        </div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="primary">Run ligfilter</button>
+      <span class="status-pill" data-role="status">idle</span>
+      <a class="secondary" data-role="download" style="display:none">Download output</a>
+      <a class="secondary" data-role="logfile" style="display:none">Download log</a>
+    </div>
+    <div class="log" data-role="log"></div>
+  </form>
+
+  <!-- ─── LIGPREP PANEL ───────────────────────────────────────────────── -->
+  <form id="form-prep" class="panel" enctype="multipart/form-data">
+    <div class="group">
+      <h3>Input</h3>
+      <div class="row">
+        <div class="field">
+          <label>Input file (.smi / .csv / .txt / .sdf)</label>
+          <input type="file" name="input_file" required accept=".smi,.csv,.tsv,.txt,.sdf,.sd">
+        </div>
+        <div class="field">
+          <label>Parallel jobs (--jobs)</label>
+          <input type="number" name="jobs" min="1" placeholder="auto">
+        </div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Tautomer / protomer (cxcalc)</h3>
+      <div class="row">
+        <div class="field"><label>--pH</label><input type="number" step="0.1" name="pH" placeholder="7.4"></div>
+        <div class="field"><label>--mode</label>
+          <select name="mode">
+            <option value="dominant">dominant (default)</option>
+            <option value="states">states</option>
+            <option value="ensemble">ensemble</option>
+          </select>
+        </div>
+        <div class="field"><label>--min-population</label><input type="number" step="0.01" name="min_population" placeholder="0.10"></div>
+        <div class="field"><label>--max-tautomers</label><input type="number" name="max_tautomers" placeholder="200"></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Stereochemistry</h3>
+      <div class="row">
+        <div class="field">
+          <label>Stereo enumeration</label>
+          <div class="checks"><label><input type="checkbox" name="no_stereo" value="1"> --no-stereo (keep input stereo)</label></div>
+        </div>
+        <div class="field"><label>--max-stereo</label><input type="number" name="max_stereo" placeholder="32"></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>CONFORGE conformers</h3>
+      <div class="row">
+        <div class="field"><label>--num-confs</label><input type="number" name="num_confs" placeholder="50 (dominant/states) / 100 (ensemble)"></div>
+        <div class="field"><label>--conforge-ewin (kcal/mol)</label><input type="number" step="0.1" name="conforge_ewin" placeholder="5.0"></div>
+        <div class="field"><label>--rmsd-threshold (Å)</label><input type="number" step="0.1" name="rmsd_threshold" placeholder="0.5"></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Ensemble mode only</h3>
+      <div class="row">
+        <div class="field"><label>--ewin (kcal/mol)</label><input type="number" step="0.1" name="ewin" placeholder="5.0"></div>
+        <div class="field"><label>--max-confs-out</label><input type="number" name="max_confs_out" placeholder="50"></div>
+      </div>
+      <div class="hint">These flags only take effect when --mode = ensemble.</div>
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="primary">Run ligprep</button>
+      <span class="status-pill" data-role="status">idle</span>
+      <a class="secondary" data-role="download" style="display:none">Download output (SDF)</a>
+      <a class="secondary" data-role="logfile" style="display:none">Download log</a>
+    </div>
+    <div class="log" data-role="log"></div>
+  </form>
+
+  <footer>
+    ligprepper webapp · backend invokes <code>ligfilter.py</code> / <code>ligprep.py</code> as subprocesses
+  </footer>
+</div>
+
+<script>
+// ─── Theme toggle ──────────────────────────────────────────────────────
+const themeBtn = document.getElementById('theme-toggle');
+function applyTheme(theme) {
+  if (theme === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+    themeBtn.textContent = 'light';
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+    themeBtn.textContent = 'dark';
+  }
+}
+applyTheme(localStorage.getItem('ligprepper-theme') || 'dark');
+themeBtn.addEventListener('click', () => {
+  const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+  localStorage.setItem('ligprepper-theme', next);
+  applyTheme(next);
+});
+
+// ─── Tab switching ─────────────────────────────────────────────────────
+const tabs = document.querySelectorAll('.tab');
+const panels = { filter: document.getElementById('form-filter'),
+                 prep:   document.getElementById('form-prep') };
+tabs.forEach(t => t.addEventListener('click', () => {
+  tabs.forEach(x => x.classList.remove('active'));
+  Object.values(panels).forEach(p => p.classList.remove('active'));
+  t.classList.add('active');
+  panels[t.dataset.tab].classList.add('active');
+}));
+
+// ─── Form submit handler (shared) ──────────────────────────────────────
+function wireForm(formId, endpoint) {
+  const form = document.getElementById(formId);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const submitBtn = form.querySelector('button.primary');
+    const statusEl  = form.querySelector('[data-role=status]');
+    const logEl     = form.querySelector('[data-role=log]');
+    const dlEl      = form.querySelector('[data-role=download]');
+    const logFileEl = form.querySelector('[data-role=logfile]');
+
+    logEl.textContent = '';
+    dlEl.style.display = 'none';
+    logFileEl.style.display = 'none';
+    statusEl.className = 'status-pill running';
+    statusEl.textContent = 'uploading…';
+    submitBtn.disabled = true;
+
+    const fd = new FormData(form);
+    let res;
+    try {
+      res = await fetch(endpoint, { method: 'POST', body: fd });
+    } catch (err) {
+      statusEl.className = 'status-pill err';
+      statusEl.textContent = 'upload failed';
+      submitBtn.disabled = false;
+      return;
+    }
+    if (!res.ok) {
+      const txt = await res.text();
+      statusEl.className = 'status-pill err';
+      statusEl.textContent = 'error ' + res.status;
+      logEl.textContent = txt;
+      submitBtn.disabled = false;
+      return;
+    }
+    const { job_id } = await res.json();
+    statusEl.textContent = 'running';
+
+    // Stream logs via SSE
+    const evt = new EventSource(`/jobs/${job_id}/stream`);
+    evt.onmessage = (m) => {
+      logEl.textContent += m.data + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+    evt.addEventListener('done', async (m) => {
+      evt.close();
+      const rc = parseInt(m.data, 10);
+      submitBtn.disabled = false;
+      if (rc === 0) {
+        statusEl.className = 'status-pill ok';
+        statusEl.textContent = 'done';
+        dlEl.href = `/jobs/${job_id}/download`;
+        dlEl.style.display = 'inline-block';
+      } else {
+        statusEl.className = 'status-pill err';
+        statusEl.textContent = 'failed (rc=' + rc + ')';
+      }
+      logFileEl.href = `/jobs/${job_id}/log`;
+      logFileEl.style.display = 'inline-block';
+    });
+    evt.onerror = () => {
+      // SSE auto-retries; only act if the job already finished.
+    };
+  });
+}
+wireForm('form-filter', '/run/ligfilter');
+wireForm('form-prep',   '/run/ligprep');
+</script>
+</body>
+</html>

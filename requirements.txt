@@ -1,0 +1,25 @@
+# ligprepper webapp dependencies
+#
+# Use a dedicated conda env so rdkit / xtb stay isolated. CDPKit is pip-only
+# (not in conda-forge as of 2026-05); install it via pip in the same env.
+#
+#   conda create -n ligprepper python=3.11
+#   conda activate ligprepper
+#   conda install -c conda-forge rdkit xtb
+#   pip install -r requirements.txt        # installs CDPKit + FastAPI + helpers
+#
+# cxcalc (ChemAxon JChem Suite) must be on PATH separately — it is
+# distributed by ChemAxon and not installable via conda/pip.
+
+# Web framework
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+jinja2>=3.1
+
+# Chemistry — rdkit / xtb come from conda above; CDPKit is pip-only
+CDPKit>=1.2
+
+# Optional CLI niceties used by ligprep.py / ligfilter.py
+tqdm>=4.66
+rich-argparse>=1.4
