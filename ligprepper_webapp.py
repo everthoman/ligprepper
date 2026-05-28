@@ -163,6 +163,8 @@ async def run_ligfilter(
     output_format: Optional[str] = Form(None),
     # preprocessing
     no_strip: Optional[str] = Form(None),
+    no_normalize: Optional[str] = Form(None),
+    no_reionize: Optional[str] = Form(None),
     no_neutralize: Optional[str] = Form(None),
     no_tautomer_canon: Optional[str] = Form(None),
     no_unique: Optional[str] = Form(None),
@@ -209,6 +211,8 @@ async def run_ligfilter(
                       "-i", str(in_path), "-o", str(out_path)]
 
     if _truthy(no_strip):          cmd.append("--no-strip")
+    if _truthy(no_normalize):      cmd.append("--no-normalize")
+    if _truthy(no_reionize):       cmd.append("--no-reionize")
     if _truthy(no_neutralize):     cmd.append("--no-neutralize")
     if _truthy(no_tautomer_canon): cmd.append("--no-tautomer-canon")
     if _truthy(no_unique):         cmd.append("--no-unique")

@@ -379,77 +379,88 @@ def _largest_fragment(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
     return largest, True
 
 
+_normalizer = None  # lazy-initialised so it's only created when --normalize is used
+_reionizer = None  # lazy-initialised so it's only created when --reionize is used
 _uncharger = None  # lazy-initialised so it's only created when --neutralize is used
 _tautomer_canon = None  # lazy-initialised so it's only created when --tautomer-canon is used
+
+
+def _standardize_step(mol: Chem.Mol, op) -> Tuple[Chem.Mol, bool]:
+    """Apply an MolStandardize op (Normalizer.normalize, Reionizer.reionize, etc.).
+
+    Strips explicit Hs first (RDKit's standardize ops are designed for the
+    implicit-H form and silently no-op or corrupt explicit-H mols), sanitizes
+    the result, and falls back to the original mol if anything throws.
+    Returns (new_mol, was_changed) and copies SD properties when changed.
+    """
+    try:
+        src = Chem.RemoveHs(mol)
+        out = op(src)
+        Chem.SanitizeMol(out)
+        out_smi = Chem.MolToSmiles(out)
+    except Exception:
+        return mol, False
+    if out_smi == Chem.MolToSmiles(src):
+        return mol, False
+    for prop in mol.GetPropNames():
+        out.SetProp(prop, mol.GetProp(prop))
+    return out, True
+
+
+def _normalize_mol(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
+    """Normalize functional-group drawing conventions (nitro, sulfoxide, …)."""
+    global _normalizer
+    if _normalizer is None:
+        _normalizer = rdMolStandardize.Normalizer()
+    return _standardize_step(mol, _normalizer.normalize)
+
+
+def _reionize_mol(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
+    """Move protons so the strongest acid sites are ionized first."""
+    global _reionizer
+    if _reionizer is None:
+        _reionizer = rdMolStandardize.Reionizer()
+    return _standardize_step(mol, _reionizer.reionize)
+
 
 def _neutralize_mol(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
     """Neutralize formal charges using RDKit's Uncharger.
 
-    Returns (neutralized_mol, was_changed).  Quaternary nitrogens and other
-    centres that cannot be neutralized without removing atoms are left intact.
+    Quaternary nitrogens and other centres that cannot be neutralized
+    without removing atoms are left intact.
     """
     global _uncharger
     if _uncharger is None:
         _uncharger = rdMolStandardize.Uncharger()
-    # Uncharger is a no-op on explicit-H mols (e.g. [N+]([H])([H]) from SDF
-    # input is not recognized as a protonated amine), so strip explicit Hs
-    # before uncharging.  SMILES output strips Hs anyway and SDF output
-    # recomputes 2D coords, so explicit-H positions aren't preserved.
-    src = Chem.RemoveHs(mol)
-    uncharged = _uncharger.uncharge(src)
-    changed = Chem.MolToSmiles(uncharged) != Chem.MolToSmiles(src)
-    # Uncharger creates a new mol object — copy SD properties from the original
-    if changed:
-        for prop in mol.GetPropNames():
-            uncharged.SetProp(prop, mol.GetProp(prop))
-        return uncharged, True
-    return mol, False
+    return _standardize_step(mol, _uncharger.uncharge)
 
 
 def _canonicalize_tautomer(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
-    """Pick a canonical tautomer using RDKit's TautomerEnumerator.
-
-    Returns (canonical_mol, was_changed).  Collapses e.g. 1H- vs 2H-tetrazole,
-    keto/enol, amide/imidic-acid forms so that tautomer pairs share a single
-    canonical SMILES for downstream deduplication.
-    """
+    """Pick a canonical tautomer (1H-/2H-tetrazole, keto/enol, amide/imidic
+    acid, …) so tautomer pairs share a single canonical SMILES for dedup."""
     global _tautomer_canon
     if _tautomer_canon is None:
         _tautomer_canon = rdMolStandardize.TautomerEnumerator()
-    # TautomerEnumerator mis-handles explicit-H input (e.g. emits [H]O=C(O)…
-    # for a protonated carboxylic acid), producing mols with invalid valence
-    # that crash later in QED/Descriptors.  Work on the implicit-H form, then
-    # fall back to the original mol if canonicalization still fails sanitize.
-    try:
-        src = Chem.RemoveHs(mol)
-        canon = _tautomer_canon.Canonicalize(src)
-        Chem.SanitizeMol(canon)
-        canon_smi = Chem.MolToSmiles(canon)
-    except Exception:
-        return mol, False
-    changed = canon_smi != Chem.MolToSmiles(Chem.RemoveHs(mol))
-    if changed:
-        for prop in mol.GetPropNames():
-            canon.SetProp(prop, mol.GetProp(prop))
-    return canon, changed
+    return _standardize_step(mol, _tautomer_canon.Canonicalize)
 
 
 def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
                 do_strip: bool,
+                do_normalize: bool,
+                do_reionize: bool,
                 do_neutralize: bool,
                 do_tautomer: bool,
                 do_unique: bool,
-                ) -> Tuple[List[Tuple[Chem.Mol, str]], int, int, int, int]:
-    """Apply salt stripping, neutralization, tautomer canonicalization, and/or
-    deduplication (in that order).
+                ) -> Tuple[List[Tuple[Chem.Mol, str]], int, int, int, int, int, int]:
+    """Apply salt stripping, functional-group normalization, reionization,
+    neutralization, tautomer canonicalization, and/or deduplication (in that order).
 
-    Returns (processed_list, n_stripped, n_neutralized, n_tautomer, n_duplicates).
-    n_stripped    = molecules where at least one fragment was removed
-    n_neutralized = molecules where at least one formal charge was neutralized
-    n_tautomer    = molecules whose tautomer was changed to the canonical form
-    n_duplicates  = extra entries removed during deduplication
+    Returns (processed_list, n_stripped, n_normalized, n_reionized,
+             n_neutralized, n_tautomer, n_duplicates).
     """
     n_stripped = 0
+    n_normalized = 0
+    n_reionized = 0
     n_neutralized = 0
     n_tautomer = 0
     n_duplicates = 0
@@ -470,13 +481,25 @@ def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
             if stripped:
                 n_stripped += 1
 
-        # 2. Neutralization
+        # 2. Functional-group normalization (e.g. nitro N(=O)=O → [N+](=O)[O-])
+        if do_normalize:
+            mol, changed = _normalize_mol(mol)
+            if changed:
+                n_normalized += 1
+
+        # 3. Reionization (move protons to strongest acid sites)
+        if do_reionize:
+            mol, changed = _reionize_mol(mol)
+            if changed:
+                n_reionized += 1
+
+        # 4. Neutralization
         if do_neutralize:
             mol, changed = _neutralize_mol(mol)
             if changed:
                 n_neutralized += 1
 
-        # 3. Tautomer canonicalization
+        # 5. Tautomer canonicalization
         if do_tautomer:
             mol, changed = _canonicalize_tautomer(mol)
             if changed:
@@ -498,7 +521,8 @@ def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
     if do_unique:
         result = list(seen.values())
 
-    return result, n_stripped, n_neutralized, n_tautomer, n_duplicates
+    return (result, n_stripped, n_normalized, n_reionized,
+            n_neutralized, n_tautomer, n_duplicates)
 
 
 # ─── Range parsing ────────────────────────────────────────────────────────────
@@ -985,6 +1009,19 @@ def main():
                           'fragment by heavy-atom count (default: on)')
     pre.add_argument('--no-strip', dest='strip', action='store_false',
                      help='Disable salt stripping')
+    pre.add_argument('--normalize', dest='normalize', action='store_true', default=True,
+                     help='Normalize functional-group drawing conventions '
+                          '(e.g. nitro N(=O)=O → [N+](=O)[O-], sulfoxide, azide, '
+                          'diazo) so different drawings of the same group dedup '
+                          '(default: on)')
+    pre.add_argument('--no-normalize', dest='normalize', action='store_false',
+                     help='Disable functional-group normalization')
+    pre.add_argument('--reionize', dest='reionize', action='store_true', default=True,
+                     help='Move protons to the strongest acid sites so '
+                          'multi-acid molecules end up in a consistent '
+                          'ionization state (default: on)')
+    pre.add_argument('--no-reionize', dest='reionize', action='store_false',
+                     help='Disable reionization')
     pre.add_argument('--neutralize', dest='neutralize', action='store_true', default=True,
                      help='Neutralize formal charges where possible '
                           '(e.g. carboxylate → carboxylic acid, ammonium → amine). '
@@ -1118,6 +1155,8 @@ def main():
     _info(f"Input:         {in_path.name}")
     _info(f"Output:        {out_path.name}")
     _info(f"Strip salts:   {'yes' if args.strip else 'no (disabled)'}")
+    _info(f"Normalize:     {'yes' if args.normalize else 'no (disabled)'}")
+    _info(f"Reionize:      {'yes' if args.reionize else 'no (disabled)'}")
     _info(f"Neutralize:    {'yes' if args.neutralize else 'no (disabled)'}")
     _info(f"Tautomer canon:{'yes' if args.tautomer else 'no (disabled)'}")
     _info(f"Deduplicate:   {'yes' if args.unique else 'no (disabled)'}")
@@ -1198,9 +1237,12 @@ def main():
     raw_stream = _iter_molecules(in_path, smiles_col=smiles_col, name_col=name_col,
                                  out_header=out_header)
 
-    molecules, n_stripped, n_neutralized, n_tautomer, n_duplicates = _preprocess(
-        raw_stream, do_strip=args.strip, do_neutralize=args.neutralize,
-        do_tautomer=args.tautomer, do_unique=args.unique)
+    (molecules, n_stripped, n_normalized, n_reionized,
+     n_neutralized, n_tautomer, n_duplicates) = _preprocess(
+        raw_stream, do_strip=args.strip,
+        do_normalize=args.normalize, do_reionize=args.reionize,
+        do_neutralize=args.neutralize, do_tautomer=args.tautomer,
+        do_unique=args.unique)
     n_read = len(molecules) + n_duplicates
 
     # ── Outlier filter (needs population statistics from preprocessed set) ────
@@ -1297,6 +1339,8 @@ def main():
     print("  [SUMMARY]")
     _info(f"Molecules read:    {n_read}")
     _info(f"Salts stripped:    {n_stripped}")
+    _info(f"Normalized:        {n_normalized}")
+    _info(f"Reionized:         {n_reionized}")
     _info(f"Neutralized:       {n_neutralized}")
     _info(f"Tautomer changed:  {n_tautomer}")
     _info(f"Duplicates removed:{n_duplicates}")
