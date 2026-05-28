@@ -380,6 +380,7 @@ def _largest_fragment(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
 
 
 _uncharger = None  # lazy-initialised so it's only created when --neutralize is used
+_tautomer_canon = None  # lazy-initialised so it's only created when --tautomer-canon is used
 
 def _neutralize_mol(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
     """Neutralize formal charges using RDKit's Uncharger.
@@ -399,20 +400,52 @@ def _neutralize_mol(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
     return uncharged, changed
 
 
+def _canonicalize_tautomer(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
+    """Pick a canonical tautomer using RDKit's TautomerEnumerator.
+
+    Returns (canonical_mol, was_changed).  Collapses e.g. 1H- vs 2H-tetrazole,
+    keto/enol, amide/imidic-acid forms so that tautomer pairs share a single
+    canonical SMILES for downstream deduplication.
+    """
+    global _tautomer_canon
+    if _tautomer_canon is None:
+        _tautomer_canon = rdMolStandardize.TautomerEnumerator()
+    # TautomerEnumerator mis-handles explicit-H input (e.g. emits [H]O=C(O)…
+    # for a protonated carboxylic acid), producing mols with invalid valence
+    # that crash later in QED/Descriptors.  Work on the implicit-H form, then
+    # fall back to the original mol if canonicalization still fails sanitize.
+    try:
+        src = Chem.RemoveHs(mol)
+        canon = _tautomer_canon.Canonicalize(src)
+        Chem.SanitizeMol(canon)
+        canon_smi = Chem.MolToSmiles(canon)
+    except Exception:
+        return mol, False
+    changed = canon_smi != Chem.MolToSmiles(Chem.RemoveHs(mol))
+    if changed:
+        for prop in mol.GetPropNames():
+            canon.SetProp(prop, mol.GetProp(prop))
+    return canon, changed
+
+
 def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
                 do_strip: bool,
                 do_neutralize: bool,
+                do_tautomer: bool,
                 do_unique: bool,
-                ) -> Tuple[List[Tuple[Chem.Mol, str]], int, int, int]:
-    """Apply salt stripping, neutralization, and/or deduplication (in that order).
+                ) -> Tuple[List[Tuple[Chem.Mol, str]], int, int, int, int]:
+    """Apply salt stripping, neutralization, tautomer canonicalization, and/or
+    deduplication (in that order).
 
-    Returns (processed_list, n_stripped, n_neutralized, n_duplicates).
+    Returns (processed_list, n_stripped, n_neutralized, n_tautomer, n_duplicates).
     n_stripped    = molecules where at least one fragment was removed
     n_neutralized = molecules where at least one formal charge was neutralized
+    n_tautomer    = molecules whose tautomer was changed to the canonical form
     n_duplicates  = extra entries removed during deduplication
     """
     n_stripped = 0
     n_neutralized = 0
+    n_tautomer = 0
     n_duplicates = 0
 
     # seen maps canonical SMILES → (mol, name) for the representative entry
@@ -437,6 +470,12 @@ def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
             if changed:
                 n_neutralized += 1
 
+        # 3. Tautomer canonicalization
+        if do_tautomer:
+            mol, changed = _canonicalize_tautomer(mol)
+            if changed:
+                n_tautomer += 1
+
         if do_unique:
             canon = Chem.MolToSmiles(mol, isomericSmiles=True)
             if canon in seen:
@@ -453,7 +492,7 @@ def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
     if do_unique:
         result = list(seen.values())
 
-    return result, n_stripped, n_neutralized, n_duplicates
+    return result, n_stripped, n_neutralized, n_tautomer, n_duplicates
 
 
 # ─── Range parsing ────────────────────────────────────────────────────────────
@@ -947,6 +986,13 @@ def main():
                           'without atom removal are left intact (default: on)')
     pre.add_argument('--no-neutralize', dest='neutralize', action='store_false',
                      help='Disable neutralization')
+    pre.add_argument('--tautomer-canon', dest='tautomer', action='store_true', default=True,
+                     help='Pick a canonical tautomer (e.g. collapse 1H-/2H-tetrazole, '
+                          'keto/enol, amide/imidic-acid) so tautomer pairs share a '
+                          'single canonical SMILES for dedup (default: on; slower per '
+                          'molecule than the other preprocessing steps)')
+    pre.add_argument('--no-tautomer-canon', dest='tautomer', action='store_false',
+                     help='Disable tautomer canonicalization')
     pre.add_argument('--unique', dest='unique', action='store_true', default=True,
                      help='Deduplicate on canonical SMILES; for duplicates '
                           'keep the entry with the lexicographically smallest '
@@ -1067,6 +1113,7 @@ def main():
     _info(f"Output:        {out_path.name}")
     _info(f"Strip salts:   {'yes' if args.strip else 'no (disabled)'}")
     _info(f"Neutralize:    {'yes' if args.neutralize else 'no (disabled)'}")
+    _info(f"Tautomer canon:{'yes' if args.tautomer else 'no (disabled)'}")
     _info(f"Deduplicate:   {'yes' if args.unique else 'no (disabled)'}")
     _info(f"Output format: {out_path.suffix.lower()[1:].upper()}")
     _info(f"Workers:       {args.jobs}")
@@ -1145,9 +1192,9 @@ def main():
     raw_stream = _iter_molecules(in_path, smiles_col=smiles_col, name_col=name_col,
                                  out_header=out_header)
 
-    molecules, n_stripped, n_neutralized, n_duplicates = _preprocess(
+    molecules, n_stripped, n_neutralized, n_tautomer, n_duplicates = _preprocess(
         raw_stream, do_strip=args.strip, do_neutralize=args.neutralize,
-        do_unique=args.unique)
+        do_tautomer=args.tautomer, do_unique=args.unique)
     n_read = len(molecules) + n_duplicates
 
     # ── Outlier filter (needs population statistics from preprocessed set) ────
@@ -1245,6 +1292,7 @@ def main():
     _info(f"Molecules read:    {n_read}")
     _info(f"Salts stripped:    {n_stripped}")
     _info(f"Neutralized:       {n_neutralized}")
+    _info(f"Tautomer changed:  {n_tautomer}")
     _info(f"Duplicates removed:{n_duplicates}")
     _info(f"Passed filters:    {n_pass}")
     _info(f"Rejected:          {n_fail}")
