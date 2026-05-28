@@ -391,13 +391,19 @@ def _neutralize_mol(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
     global _uncharger
     if _uncharger is None:
         _uncharger = rdMolStandardize.Uncharger()
-    uncharged = _uncharger.uncharge(mol)
-    changed = Chem.MolToSmiles(uncharged) != Chem.MolToSmiles(mol)
+    # Uncharger is a no-op on explicit-H mols (e.g. [N+]([H])([H]) from SDF
+    # input is not recognized as a protonated amine), so strip explicit Hs
+    # before uncharging.  SMILES output strips Hs anyway and SDF output
+    # recomputes 2D coords, so explicit-H positions aren't preserved.
+    src = Chem.RemoveHs(mol)
+    uncharged = _uncharger.uncharge(src)
+    changed = Chem.MolToSmiles(uncharged) != Chem.MolToSmiles(src)
     # Uncharger creates a new mol object — copy SD properties from the original
     if changed:
         for prop in mol.GetPropNames():
             uncharged.SetProp(prop, mol.GetProp(prop))
-    return uncharged, changed
+        return uncharged, True
+    return mol, False
 
 
 def _canonicalize_tautomer(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
