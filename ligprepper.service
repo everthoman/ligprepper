@@ -1,0 +1,11 @@
+[Unit]
+Description=LigPrepper Web App
+After=network.target
+
+[Service]
+ExecStart=/home/evehom/Programs/miniconda3/envs/ligprepper/bin/python -m uvicorn ligprepper_webapp:app --host 0.0.0.0 --port 5009 --log-level info
+WorkingDirectory=/opt/webapps/ligprepper
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
