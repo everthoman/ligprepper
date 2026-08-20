@@ -327,6 +327,7 @@ footer { text-align: center; color: var(--text-muted); font-size: 0.75rem; margi
 
     <div class="actions">
       <button type="submit" class="primary">Run ligfilter</button>
+      <button type="button" class="secondary" data-role="cancel" style="display:none">Cancel</button>
       <span class="status-pill" data-role="status">idle</span>
       <a class="secondary" data-role="download" style="display:none">Download output</a>
       <a class="secondary" data-role="logfile" style="display:none">Download log</a>
@@ -397,6 +398,7 @@ footer { text-align: center; color: var(--text-muted); font-size: 0.75rem; margi
 
     <div class="actions">
       <button type="submit" class="primary">Run ligprep</button>
+      <button type="button" class="secondary" data-role="cancel" style="display:none">Cancel</button>
       <span class="status-pill" data-role="status">idle</span>
       <a class="secondary" data-role="download" style="display:none">Download output (SDF)</a>
       <a class="secondary" data-role="logfile" style="display:none">Download log</a>
@@ -445,6 +447,7 @@ function wireForm(formId, endpoint) {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const submitBtn = form.querySelector('button.primary');
+    const cancelBtn = form.querySelector('[data-role=cancel]');
     const statusEl  = form.querySelector('[data-role=status]');
     const logEl     = form.querySelector('[data-role=log]');
     const dlEl      = form.querySelector('[data-role=download]');
@@ -478,6 +481,20 @@ function wireForm(formId, endpoint) {
     const { job_id } = await res.json();
     statusEl.textContent = 'running';
 
+    let cancelRequested = false;
+    cancelBtn.disabled = false;
+    cancelBtn.style.display = 'inline-block';
+    cancelBtn.onclick = async () => {
+      cancelRequested = true;
+      cancelBtn.disabled = true;
+      statusEl.textContent = 'cancelling…';
+      try {
+        await fetch(`/jobs/${job_id}/cancel`, { method: 'POST' });
+      } catch (err) {
+        // job may already have finished; the 'done' handler below settles the UI either way
+      }
+    };
+
     // Stream logs via SSE
     const evt = new EventSource(`/jobs/${job_id}/stream`);
     evt.onmessage = (m) => {
@@ -488,11 +505,15 @@ function wireForm(formId, endpoint) {
       evt.close();
       const rc = parseInt(m.data, 10);
       submitBtn.disabled = false;
+      cancelBtn.style.display = 'none';
       if (rc === 0) {
         statusEl.className = 'status-pill ok';
         statusEl.textContent = 'done';
         dlEl.href = `/jobs/${job_id}/download`;
         dlEl.style.display = 'inline-block';
+      } else if (cancelRequested) {
+        statusEl.className = 'status-pill err';
+        statusEl.textContent = 'cancelled';
       } else {
         statusEl.className = 'status-pill err';
         statusEl.textContent = 'failed (rc=' + rc + ')';

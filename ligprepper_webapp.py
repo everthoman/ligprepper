@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
@@ -61,7 +62,8 @@ logger = logging.getLogger("ligprepper")
 
 class Job:
     __slots__ = ("id", "dir", "script", "input_path", "output_path",
-                 "log_path", "proc", "returncode", "started", "finished")
+                 "log_path", "proc", "returncode", "started", "finished",
+                 "cancelled")
 
     def __init__(self, script: str):
         self.id = uuid.uuid4().hex[:12]
@@ -75,6 +77,7 @@ class Job:
         self.returncode: Optional[int] = None
         self.started: datetime = datetime.utcnow()
         self.finished: Optional[datetime] = None
+        self.cancelled: bool = False
 
 
 JOBS: dict[str, Job] = {}
@@ -112,6 +115,7 @@ async def _run_subprocess(job: Job, cmd: list[str]) -> None:
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             cwd=str(job.dir),
+            start_new_session=True,  # own process group, so cancel can kill worker pools too
         )
         job.returncode = await job.proc.wait()
     finally:
@@ -330,9 +334,27 @@ async def job_status(job_id: str):
         "script": job.script,
         "running": running,
         "returncode": job.returncode,
+        "cancelled": job.cancelled,
         "output_exists": job.output_path is not None and job.output_path.exists(),
         "output_name": job.output_path.name if job.output_path else None,
     }
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def job_cancel(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    if job.proc is None or job.returncode is not None:
+        raise HTTPException(409, "job is not running")
+    job.cancelled = True
+    try:
+        # proc is a session leader (start_new_session=True), so its pid is
+        # also the process group id — this reaches any worker pool it spawned.
+        os.killpg(job.proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        raise HTTPException(409, "job is not running")
+    return {"job_id": job.id, "cancelled": True}
 
 
 @app.get("/jobs/{job_id}/stream")
