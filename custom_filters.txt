@@ -14,15 +14,35 @@
 # back to a neutral species at physiological pH; downstream protomer
 # enumeration (ligprep --pH) handles them correctly.
 
-# Permanent cations: quaternary nitrogen, phosphonium, sulfonium
+# Permanent cations: quaternary nitrogen, phosphonium, sulfonium, carbocation
 [#7+;X4;H0]	0	quaternary ammonium
 [#15+;X4;H0]	0	phosphonium
 [#16+;X3;H0]	0	sulfonium
+[#6+]	0	carbocation
+[#7;!+0;!$([n+]-[O-]);!$([N+;H1,H2,H3]);!$([n+;H1])]	0	charged nitrogen (excl. pyridine N-oxide / protonated amine)
 
 # Permanent anions: low-pKa oxyacids fully deprotonated at neutral pH
 [#16](=O)(=O)[O-]	0	sulfonate / sulfate
 [#15](=O)([O-])[O-]	0	phosphonate / phosphate (di-anion)
 [#15](=O)(O)[O-]	0	phosphonate / phosphate (mono-anion)
+
+# ── Blanket exclusions ──────────────────────────────────────────────────────────
+# Reject on element/motif presence rather than a narrower toxicophore/reactivity
+# rationale — broader than the sections above by design.
+[#15]	0	any phosphorus
+[#8][#16](=O)(=O)	0	OSO2 (sulfonate/sulfate ester, acid, or anion — any oxidation/protonation state)
+[#16]-[OX2H1]	0	S-OH (sulfenic/sulfinic/sulfonic acid — reactive/unstable)
+[#7;!a]-[$([#7;!a]),$([#8;!a;!$([#8]-[#7]=[#6]);!$([#8]-[#7]-[CX3]=[OX1])]),$([#16;!a;!$([#16]=[#8])])]	0	aliphatic N-N/N-O/N-S (e.g. hydrazine, hydroxylamine, sulfenamide; excludes sulfonamide/sulfinamide, aromatic ring N-N/N-O/N-S, and N-O in oximes/isoxazolines/hydroxamic acids)
+
+# ── Hydrolytically unstable / reactive groups ───────────────────────────────────
+# Simple Schiff bases (imines) equilibrate with the parent amine + aldehyde/ketone
+# under aqueous conditions; aryl conjugation doesn't meaningfully protect against
+# this, so aryl and aliphatic imines are treated the same. Amidines, guanidines,
+# oximes, and hydrazones are excluded — those are resonance/conjugation-stabilized
+# and are common, stable drug motifs. Plain enamines are similarly excluded only
+# when conjugated to a carbonyl (enaminone / vinylogous amide), which is stable.
+[CX3;!a;!$([#6](=[#7])-[#7])]=[NX2;!a;!$([#7]-[#7]);!$([#7]-[#8])]	0	aliphatic/aryl imine (Schiff base)
+[NX3;!a]-[CX3;!a]=[CX3;!a;!$([#6]-[CX3]=[OX1])]	0	enamine (excl. enaminone/vinylogous amide)
 
 # ── Isotopes ──────────────────────────────────────────────────────────────────
 # RDKit SMARTS has no general "any isotope label" query, so each isotope
