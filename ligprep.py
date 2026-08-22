@@ -66,6 +66,7 @@ import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional, Tuple
 
 try:
     from rich_argparse import RawDescriptionRichHelpFormatter as _HelpFmt
@@ -92,6 +93,7 @@ try:
     from rdkit.Chem import AllChem
     from rdkit.Chem.EnumerateStereoisomers import (
         EnumerateStereoisomers,
+        GetStereoisomerCount,
         StereoEnumerationOptions,
     )
     RDLogger.DisableLog("rdApp.*")
@@ -335,8 +337,14 @@ def _mol_job(job: dict) -> "tuple[list[str], list[dict]]":
     try:
         for t_idx, mol_bytes, t_pop in job["states"]:
             t_mol   = Chem.Mol(mol_bytes)
-            isomers = [t_mol] if no_stereo else _enumerate_stereo(t_mol, max_stereo)
-            stereo_weight = 1.0 / len(isomers)
+            if no_stereo:
+                isomers, true_stereo_count = [t_mol], 1
+            else:
+                isomers, true_stereo_count = _enumerate_stereo(t_mol, max_stereo)
+            # Weight by the true combinatorial isomer count, not the
+            # (possibly --max-stereo-truncated) number actually kept, so
+            # each kept isomer's reported population isn't over-stated.
+            stereo_weight = 1.0 / true_stereo_count
 
             for s_idx, iso in enumerate(isomers, start=1):
                 state_pop     = t_pop * stereo_weight
@@ -403,6 +411,7 @@ def _mol_job(job: dict) -> "tuple[list[str], list[dict]]":
 
 def _cxcalc_batch(
     mols_with_ids: list, pH: float, max_tautomers: int, min_population: float,
+    timeout: Optional[int] = None,
 ) -> dict:
     """Run cxcalc on a list of (mol, mol_id) pairs. Re-indexes internally."""
     idx_to_id = {str(i): mol_id for i, (_, mol_id) in enumerate(mols_with_ids)}
@@ -412,11 +421,14 @@ def _cxcalc_batch(
         for i, (mol, _) in enumerate(mols_with_ids):
             fh.write(f"{Chem.MolToSmiles(mol)}\t{i}\n")
     try:
-        result = subprocess.run(
-            ["cxcalc", "tautomers", "-D", "true", "-n", "true",
-             "-H", str(pH), "-m", str(max_tautomers), "-f", "sdf", tmp_path],
-            capture_output=True, text=True, check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["cxcalc", "tautomers", "-D", "true", "-n", "true",
+                 "-H", str(pH), "-m", str(max_tautomers), "-f", "sdf", tmp_path],
+                capture_output=True, text=True, check=False, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"cxcalc timed out after {timeout}s ({len(mols_with_ids)} molecule(s))")
         if result.returncode != 0:
             raise RuntimeError(f"cxcalc failed (rc={result.returncode}):\n{result.stderr.strip()}")
         sdf_text = result.stdout
@@ -428,48 +440,67 @@ def _cxcalc_batch(
 
 def _run_cxcalc_chunk(
     chunk: list, pH: float, max_tautomers: int, min_population: float,
-    retry_batch: int = 50,
-) -> dict:
-    """Run cxcalc on a chunk with fallback retry for empty results.
+    retry_batch: int = 50, timeout: Optional[int] = None,
+) -> Tuple[dict, dict]:
+    """Run cxcalc on a chunk with fallback retry for empty/failed results.
 
-    If one molecule crashes cxcalc mid-batch, all subsequent molecules in the
-    batch produce no output.  Detected by checking for empty groups after the
-    first pass; empties are retried in smaller sub-batches, then individually.
+    If one molecule crashes cxcalc mid-batch (or the whole batch call fails
+    or times out), all molecules in the batch produce no output.  Detected
+    by checking for empty groups (or by catching the RuntimeError from a
+    failed/timed-out batch call) after the first pass; empties are retried
+    in smaller sub-batches, then individually.  Molecules that still fail
+    after being retried alone are reported back as failures rather than
+    aborting the whole run.
     """
-    groups = _cxcalc_batch(chunk, pH, max_tautomers, min_population)
+    try:
+        groups = _cxcalc_batch(chunk, pH, max_tautomers, min_population, timeout=timeout)
+    except RuntimeError as e:
+        print(f"[WARN]  cxcalc batch of {len(chunk)} failed ({e}); retrying in sub-batches")
+        groups = {mol_id: [] for _, mol_id in chunk}
 
+    failures: dict = {}
     empties = [(mol, mol_id) for mol, mol_id in chunk if not groups[mol_id]]
     if not empties:
-        return groups
+        return groups, failures
 
     n_recovered = 0
     # Second pass: small sub-batches
     for i in range(0, len(empties), retry_batch):
         sub = empties[i:i + retry_batch]
-        sub_groups = _cxcalc_batch(sub, pH, max_tautomers, min_population)
+        try:
+            sub_groups = _cxcalc_batch(sub, pH, max_tautomers, min_population, timeout=timeout)
+        except RuntimeError as e:
+            print(f"[WARN]  cxcalc sub-batch of {len(sub)} failed ({e}); retrying individually")
+            sub_groups = {}
         for _, mol_id in sub:
-            if sub_groups[mol_id]:
+            if sub_groups.get(mol_id):
                 groups[mol_id] = sub_groups[mol_id]
                 n_recovered += 1
 
     # Third pass: any still-empty molecules run individually
     still_empty = [(mol, mol_id) for mol, mol_id in empties if not groups[mol_id]]
     for mol, mol_id in still_empty:
-        single = _cxcalc_batch([(mol, mol_id)], pH, max_tautomers, min_population)
+        try:
+            single = _cxcalc_batch([(mol, mol_id)], pH, max_tautomers, min_population, timeout=timeout)
+        except RuntimeError as e:
+            failures[mol_id] = str(e)
+            continue
         if single[mol_id]:
             groups[mol_id] = single[mol_id]
             n_recovered += 1
 
     if n_recovered:
         print(f"[INFO]  cxcalc fallback recovered {n_recovered}/{len(empties)} empty result(s)")
-    return groups
+    if failures:
+        print(f"[WARNING] cxcalc permanently failed for {len(failures)} molecule(s)")
+    return groups, failures
 
 
 def _run_cxcalc_tautomers(
     mols_with_ids: list, pH: float = 7.4,
     max_tautomers: int = 200, min_population: float = 0.01,
-    chunk_size: int = 5000,
-) -> dict:
+    chunk_size: int = 5000, timeout: Optional[int] = None,
+) -> Tuple[dict, dict]:
     if not _CXCALC:
         raise RuntimeError("cxcalc not found on PATH")
 
@@ -478,11 +509,15 @@ def _run_cxcalc_tautomers(
     n_chunks = len(chunks)
 
     groups: dict = {}
+    failures: dict = {}
     for c_idx, chunk in enumerate(chunks, start=1):
         if n_chunks > 1:
             print(f"[INFO]  cxcalc chunk {c_idx}/{n_chunks} ({len(chunk)} molecules)")
-        groups.update(_run_cxcalc_chunk(chunk, pH, max_tautomers, min_population))
-    return groups
+        chunk_groups, chunk_failures = _run_cxcalc_chunk(
+            chunk, pH, max_tautomers, min_population, timeout=timeout)
+        groups.update(chunk_groups)
+        failures.update(chunk_failures)
+    return groups, failures
 
 
 def _parse_tautomer_sdf(sdf_text: str, idx_to_id: dict, min_population: float) -> dict:
@@ -517,10 +552,20 @@ def _parse_tautomer_sdf(sdf_text: str, idx_to_id: dict, min_population: float) -
 # Stereo enumeration + input parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _enumerate_stereo(mol: "Chem.Mol", max_isomers: int = 32) -> list:
+def _enumerate_stereo(mol: "Chem.Mol", max_isomers: int = 32) -> "tuple[list, int]":
+    """Return (kept_isomers, true_isomer_count).
+
+    true_isomer_count is the full combinatorial count of unassigned-center
+    stereoisomers (via GetStereoisomerCount), which may exceed len(kept_isomers)
+    when maxIsomers truncates enumeration — callers need the true count to
+    weight each kept isomer's population correctly.
+    """
     opts    = StereoEnumerationOptions(unique=True, onlyUnassigned=True, maxIsomers=max_isomers)
     isomers = list(EnumerateStereoisomers(mol, options=opts))
-    return isomers if isomers else [mol]
+    if not isomers:
+        return [mol], 1
+    true_count = max(len(isomers), GetStereoisomerCount(mol, options=opts))
+    return isomers, true_count
 
 
 def _read_input(path: Path) -> "tuple[list, list[dict]]":
@@ -591,6 +636,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max tautomers per molecule passed to cxcalc (default: 200)")
     p.add_argument("--cxcalc-chunk", type=int, default=5000, metavar="INT",
                    help="Molecules per cxcalc batch (default: 5000)")
+    p.add_argument("--cxcalc-timeout", type=int, default=300, metavar="SEC",
+                   dest="cxcalc_timeout",
+                   help="cxcalc per-batch timeout in seconds (default: 300); "
+                        "on timeout or nonzero exit the batch is retried in "
+                        "smaller sub-batches, then per-molecule")
     p.add_argument("--mode", choices=["dominant", "states", "ensemble"],
                    default="dominant",
                    help="dominant: 1 best conformer; states: 1 conf per state; "
@@ -688,21 +738,31 @@ def main() -> None:
           + (f" ({len(input_failures)} failed to parse)" if input_failures else ""))
 
     seen: dict[str, int] = {}
+    used_uids: set[str] = {name for _, name in raw_mols}
     mols_with_ids = []
     for mol, name in raw_mols:
         if name in seen:
-            seen[name] += 1; uid = f"{name}_{seen[name]}"
+            seen[name] += 1
+            uid = f"{name}_{seen[name]}"
+            # Guard against colliding with an unrelated molecule that already
+            # has this exact name (e.g. input has both "X" (x2) and "X_1").
+            while uid in used_uids:
+                seen[name] += 1
+                uid = f"{name}_{seen[name]}"
         else:
             seen[name] = 0; uid = name
+        used_uids.add(uid)
         mols_with_ids.append((mol, uid))
 
     print(f"\n[STEP 2/3] cxcalc tautomers -D true -n true -H {args.pH}")
     _pop_filter    = 0.0 if args.mode == "dominant" else args.min_population
-    tautomer_groups = _run_cxcalc_tautomers(
+    tautomer_groups, cxcalc_failures = _run_cxcalc_tautomers(
         mols_with_ids, pH=args.pH,
         max_tautomers=args.max_tautomers, min_population=_pop_filter,
-        chunk_size=args.cxcalc_chunk,
+        chunk_size=args.cxcalc_chunk, timeout=args.cxcalc_timeout,
     )
+    for mol_id, reason in cxcalc_failures.items():
+        all_failures.append({"id": mol_id, "stage": "cxcalc", "reason": reason})
     if args.mode == "dominant":
         tautomer_groups = {mid: v[:1] for mid, v in tautomer_groups.items()}
         print(f"[INFO]  dominant state selected for "
@@ -721,7 +781,8 @@ def main() -> None:
     for mol, mol_id in mols_with_ids:
         states = tautomer_groups.get(mol_id, [])
         if not states:
-            all_failures.append({"id": mol_id, "stage": "tautomers", "reason": "no states above population threshold"})
+            if mol_id not in cxcalc_failures:
+                all_failures.append({"id": mol_id, "stage": "tautomers", "reason": "no states above population threshold"})
             continue
         jobs.append({
             "mol_id":        mol_id,

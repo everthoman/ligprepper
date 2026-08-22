@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -45,6 +46,12 @@ LIGPREP = ROOT / "ligprep.py"
 # all available). Override with LIGPREPPER_SCRIPT_PYTHON if a different env
 # must run the scripts.
 SCRIPT_PYTHON = os.environ.get("LIGPREPPER_SCRIPT_PYTHON", sys.executable)
+
+# Finished job directories (input/output/log) older than this are swept up
+# periodically — the service runs indefinitely, so without this jobs/ and the
+# in-memory JOBS dict grow without bound.
+JOB_RETENTION_HOURS = float(os.environ.get("LIGPREPPER_JOB_RETENTION_HOURS", "48"))
+JOB_CLEANUP_INTERVAL_SECONDS = 3600
 
 LOG_FILE = ROOT / "ligprepper_webapp.log"
 logging.basicConfig(
@@ -110,18 +117,64 @@ async def _run_subprocess(job: Job, cmd: list[str]) -> None:
     logger.info("job %s start: %s", job.id, " ".join(cmd))
     log_fh = open(job.log_path, "wb")
     try:
-        job.proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            cwd=str(job.dir),
-            start_new_session=True,  # own process group, so cancel can kill worker pools too
-        )
+        try:
+            job.proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                cwd=str(job.dir),
+                start_new_session=True,  # own process group, so cancel can kill worker pools too
+            )
+        except OSError as e:
+            # e.g. LIGPREPPER_SCRIPT_PYTHON points at a missing/broken
+            # interpreter. Surface it in the log and mark the job done
+            # instead of leaving it stuck "running" forever.
+            logger.exception("job %s failed to start", job.id)
+            log_fh.write(f"[ERROR] failed to start process: {e}\n".encode())
+            job.returncode = -1
+            return
         job.returncode = await job.proc.wait()
     finally:
         log_fh.close()
         job.finished = datetime.utcnow()
         logger.info("job %s done rc=%s", job.id, job.returncode)
+
+
+def _cleanup_old_jobs() -> None:
+    """Remove job directories (and their JOBS entries) whose age exceeds
+    JOB_RETENTION_HOURS. Never touches a job that's still running. Also
+    sweeps directories left behind by a previous process (JOBS is
+    in-memory, so a restart forgets everything but the jobs/ dirs remain —
+    any such orphaned directory belongs to a job whose subprocess already
+    died with the old process, so it's always safe to age out)."""
+    if not JOBS_DIR.exists():
+        return
+    cutoff = time.time() - JOB_RETENTION_HOURS * 3600
+    for job_dir in JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        job_id = job_dir.name
+        job = JOBS.get(job_id)
+        if job is not None and job.returncode is None:
+            continue  # still running — never touch
+        try:
+            if job_dir.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(job_dir)
+        except OSError:
+            logger.exception("failed to clean up job dir %s", job_dir)
+            continue
+        JOBS.pop(job_id, None)
+        logger.info("cleaned up stale job %s (older than %.0fh)", job_id, JOB_RETENTION_HOURS)
+
+
+async def _cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(JOB_CLEANUP_INTERVAL_SECONDS)
+        try:
+            _cleanup_old_jobs()
+        except Exception:
+            logger.exception("job cleanup sweep failed")
 
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
@@ -131,7 +184,10 @@ async def lifespan(app: FastAPI):
     logger.info("ligprepper webapp starting — script python: %s", SCRIPT_PYTHON)
     if not LIGFILTER.exists() or not LIGPREP.exists():
         logger.warning("ligprep.py or ligfilter.py missing in %s", ROOT)
+    _cleanup_old_jobs()  # sweep dirs left behind by a previous run at startup
+    cleanup_task = asyncio.create_task(_cleanup_loop())
     yield
+    cleanup_task.cancel()
     logger.info("ligprepper webapp shutting down")
 
 
@@ -358,10 +414,19 @@ async def job_cancel(job_id: str):
 
 
 @app.get("/jobs/{job_id}/stream")
-async def job_stream(job_id: str):
+async def job_stream(job_id: str, request: Request):
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(404, "unknown job")
+
+    # EventSource automatically resends the last "id:" it saw as this header
+    # on reconnect — use it as a byte offset so a dropped connection resumes
+    # instead of re-streaming (and duplicating) the whole log from the start.
+    last_id = request.headers.get("last-event-id")
+    try:
+        start_offset = max(0, int(last_id)) if last_id is not None else 0
+    except ValueError:
+        start_offset = 0
 
     async def gen():
         # Wait briefly for the log file to appear.
@@ -370,14 +435,18 @@ async def job_stream(job_id: str):
                 break
             await asyncio.sleep(0.05)
         # Stream the log; tail-follow until process finishes and file is fully drained.
+        offset = start_offset
         with open(job.log_path, "rb") as fh:
+            fh.seek(offset)
             while True:
                 chunk = fh.read(4096)
                 if chunk:
+                    offset += len(chunk)
                     text = chunk.decode("utf-8", errors="replace")
-                    # SSE: prefix every line with "data: " and end with blank line
+                    # SSE: prefix every line with "data: " and end with blank line;
+                    # "id:" lets a reconnect resume from here instead of byte 0.
                     for line in text.splitlines():
-                        yield f"data: {line}\n\n".encode("utf-8")
+                        yield f"id: {offset}\ndata: {line}\n\n".encode("utf-8")
                 else:
                     if job.returncode is not None:
                         # final drain done

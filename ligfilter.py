@@ -43,6 +43,7 @@ Written by Claude Sonnet 4.6, 2026-02-27
 import argparse
 import math
 import os
+import re
 import statistics
 import sys
 import time
@@ -401,7 +402,12 @@ def _standardize_step(mol: Chem.Mol, op) -> Tuple[Chem.Mol, bool]:
     except Exception:
         return mol, False
     if out_smi == Chem.MolToSmiles(src):
-        return mol, False
+        # No-op: still return the H-stripped form (not the original mol),
+        # so a step that happens not to fire doesn't leave explicit Hs
+        # attached and break dedup consistency with mols where it did fire.
+        for prop in mol.GetPropNames():
+            src.SetProp(prop, mol.GetProp(prop))
+        return src, False
     for prop in mol.GetPropNames():
         out.SetProp(prop, mol.GetProp(prop))
     return out, True
@@ -923,14 +929,21 @@ def _pool_worker(batch_binary: list) -> list:
     """
     results = []
     for mol_b, name in batch_binary:
-        mol = Chem.Mol(mol_b)
-        reason = None
-        for _label, filt_fn in _shared_pipeline:
-            reason = filt_fn(mol, None)
-            if reason:
-                break
-        props = _mol_props(mol)
-        results.append((mol.ToBinary(_PICKLE_PROPS) if reason is None else None, name, reason, props))
+        try:
+            mol = Chem.Mol(mol_b)
+            reason = None
+            for _label, filt_fn in _shared_pipeline:
+                reason = filt_fn(mol, None)
+                if reason:
+                    break
+            props = _mol_props(mol)
+            mol_out = mol.ToBinary(_PICKLE_PROPS) if reason is None else None
+        except Exception as e:
+            # Don't let one bad molecule (e.g. an RDKit edge case in QED or a
+            # custom SMARTS match) take down the whole batch/run — reject it
+            # with the error as the reason and keep going.
+            mol_out, reason, props = None, f"error: {e}", {}
+        results.append((mol_out, name, reason, props))
     return results
 
 
@@ -983,6 +996,11 @@ def main():
         description=__doc__,
         formatter_class=_HelpFmt,
     )
+    # RANGE-format flags (e.g. --logp -2:5) start with '-', which argparse
+    # would otherwise mistake for an unknown option since none of our
+    # options are themselves negative numbers.  Widen the built-in
+    # negative-number matcher to also accept MIN:MAX / MIN: / :MAX forms.
+    p._negative_number_matcher = re.compile(r'^-\d*\.?\d+(:-?\d*\.?\d*)?$|^-\d*\.?\d+:$')
 
     io = p.add_argument_group('Input / Output')
     io.add_argument('input', metavar='FILE', nargs='?', default=None,
@@ -1330,8 +1348,7 @@ def main():
         if pool is not None:
             pool.close()
             pool.join()
-
-    close_out()
+        close_out()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0
